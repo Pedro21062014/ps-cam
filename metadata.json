@@ -1,0 +1,11 @@
+{
+  "name": "PS Cam",
+  "description": "A modern security camera system turning one phone into a camera and another into a viewer using WebRTC and Firebase.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
