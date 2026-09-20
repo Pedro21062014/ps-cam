@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { auth, db, googleProvider } from './firebase';
+import { auth, db, rtdb, googleProvider } from './firebase';
 import { 
   signInWithPopup, 
   signOut, 
@@ -22,18 +22,21 @@ import {
   deleteDoc,
   getDoc
 } from "firebase/firestore";
-import { UserProfile, AppMode, CameraCommand } from './types';
+import { ref, onValue, off, set, remove } from "firebase/database";
+import { UserProfile, AppMode, CameraCommand, AndroidCamera } from './types';
 import { 
   Camera, Eye, LogOut, Zap, Bell, StopCircle, 
   HardDrive, QrCode, Mail, Lock, User, ArrowRight, 
   AlertCircle, Smartphone, RefreshCw, Trash2, Volume2, VolumeX,
   Wifi, Loader2, Activity, Disc, CheckCircle, Cloud, Film, Moon, Sun, SwitchCamera, Link, Infinity,
-  Monitor, Settings2, UploadCloud
+  Monitor, Settings2, UploadCloud, Radio, Battery, BatteryCharging, BatteryLow, BatteryMedium, ExternalLink, Copy, Check, ShieldCheck, Plus
 } from 'lucide-react';
 import QRCode from 'react-qr-code';
 import Scanner from './components/Scanner';
 import MotionDetector from './components/MotionDetector';
 import Timeline from './components/Timeline';
+import AndroidCameraViewer from './components/AndroidCameraViewer';
+
 
 // Definição do PeerJS global
 declare const Peer: any;
@@ -77,7 +80,18 @@ const App: React.FC = () => {
   
   // Data States
   const [activeSessions, setActiveSessions] = useState<any[]>([]);
+  const [androidCameras, setAndroidCameras] = useState<AndroidCamera[]>([]);
+  const [selectedAndroidCamera, setSelectedAndroidCamera] = useState<AndroidCamera | null>(null);
+  const [catalogFilter, setCatalogFilter] = useState<'all' | 'android' | 'p2p'>('all');
+  const [copiedCamId, setCopiedCamId] = useState<string | null>(null);
+  const [showAddManualModal, setShowAddManualModal] = useState(false);
+  const [manualIp, setManualIp] = useState('');
+  const [manualPort, setManualPort] = useState('8080');
+  const [manualName, setManualName] = useState('');
   const [showScanner, setShowScanner] = useState(false);
+  
+  // Store reference to consolidate cameras from multiple Firebase sources
+  const camerasStoreRef = useRef<Map<string, AndroidCamera>>(new Map());
   
   // Refs
   const peerRef = useRef<any>(null);
@@ -109,6 +123,8 @@ const App: React.FC = () => {
 
   // --- INITIALIZATION ---
   useEffect(() => {
+    let unsubAndroid: (() => void) | null = null;
+
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       if (currentUser) {
         setUser({
@@ -118,23 +134,286 @@ const App: React.FC = () => {
           photoURL: currentUser.photoURL
         });
         fetchUserSessions(currentUser.uid);
+        unsubAndroid = listenToAndroidCameras(currentUser.uid, currentUser.email);
       } else {
+        if (unsubAndroid) unsubAndroid();
         setUser(null);
         setMode(AppMode.SELECT);
         setActiveSessions([]);
+        setAndroidCameras([]);
+        camerasStoreRef.current.clear();
         setGoogleAccessToken(null);
       }
     });
-    return () => unsubscribe();
+
+    return () => {
+      unsubscribe();
+      if (unsubAndroid) unsubAndroid();
+    };
   }, []);
 
-  const fetchUserSessions = (uid: string) => {
-    const q = query(collection(db, "sessions"), where("hostId", "==", uid));
-    return onSnapshot(q, (snapshot) => {
-      const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setActiveSessions(sessions);
-    });
+  const getStoredManualCameras = (uid: string): AndroidCamera[] => {
+    try {
+      const data = localStorage.getItem(`ps_cam_manual_${uid}`);
+      return data ? JSON.parse(data) : [];
+    } catch {
+      return [];
+    }
   };
+
+  const saveStoredManualCameras = (uid: string, cams: AndroidCamera[]) => {
+    try {
+      localStorage.setItem(`ps_cam_manual_${uid}`, JSON.stringify(cams));
+    } catch (e) {
+      console.warn("LocalStorage save error:", e);
+    }
+  };
+
+  const listenToAndroidCameras = (uid: string, userEmail: string | null) => {
+    const unsubs: (() => void)[] = [];
+    camerasStoreRef.current.clear();
+
+    const updateState = () => {
+      const list = Array.from(camerasStoreRef.current.values()).sort((a, b) => {
+        const aOnline = a.isOnline || a.status === 'online' ? 1 : 0;
+        const bOnline = b.isOnline || b.status === 'online' ? 1 : 0;
+        if (aOnline !== bOnline) return bOnline - aOnline;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+      setAndroidCameras(list);
+    };
+
+    // 0. Load locally saved manual cameras first so they are immediately available
+    try {
+      const savedManuals = getStoredManualCameras(uid);
+      savedManuals.forEach(cam => {
+        camerasStoreRef.current.set(cam.id, cam);
+      });
+      updateState();
+    } catch (e) {
+      console.warn("Manual camera local restore error:", e);
+    }
+
+    const processItem = (id: string, data: any, source: AndroidCamera['source']) => {
+      if (!data) return;
+      const belongs = 
+        source === 'manual' ||
+        source === 'firestore-user' || source === 'rtdb-user' ||
+        (!data.userId && !data.userEmail) ||
+        (data.userId && data.userId === uid) ||
+        (userEmail && data.userEmail && data.userEmail.toLowerCase() === userEmail.toLowerCase());
+
+      if (!belongs) return;
+
+      const ip = data.ipAddress || data.ip || '';
+      const port = data.port || 8080;
+      let streamUrl = data.streamUrl || (ip ? `http://${ip}:${port}` : '');
+      if (streamUrl && !streamUrl.startsWith('http://') && !streamUrl.startsWith('https://')) {
+        streamUrl = `http://${streamUrl}`;
+      }
+
+      const isOnline = data.isOnline !== undefined ? Boolean(data.isOnline) : (data.status === 'online');
+
+      const cam: AndroidCamera = {
+        id: id || data.id || `cam-${Date.now()}`,
+        name: data.name || data.deviceName || 'Android PS Cam',
+        ipAddress: ip,
+        port: port,
+        streamUrl: streamUrl,
+        isOnline: isOnline,
+        status: data.status || (isOnline ? 'online' : 'offline'),
+        battery: typeof data.battery === 'number' ? data.battery : (data.batteryLevel ? Number(data.batteryLevel) : undefined),
+        batteryCharging: Boolean(data.batteryCharging || data.charging),
+        userId: data.userId || uid,
+        userEmail: data.userEmail || userEmail || undefined,
+        lastSeen: data.lastSeen || data.updatedAt,
+        source: source
+      };
+
+      camerasStoreRef.current.set(cam.id, cam);
+      updateState();
+    };
+
+    // 1. Firestore: /users/{userId}/cameras
+    try {
+      const userCamsRef = collection(db, "users", uid, "cameras");
+      const unsubUserCams = onSnapshot(userCamsRef, (snap) => {
+        snap.docs.forEach(d => processItem(d.id, d.data(), 'firestore-user'));
+        snap.docChanges().forEach(ch => {
+          if (ch.type === 'removed') {
+            // Only remove if not locally pinned manual
+            const current = camerasStoreRef.current.get(ch.doc.id);
+            if (current && current.source !== 'manual') {
+              camerasStoreRef.current.delete(ch.doc.id);
+              updateState();
+            }
+          }
+        });
+      }, err => console.warn("Firestore /users/{id}/cameras listener:", err));
+      unsubs.push(unsubUserCams);
+    } catch (e) {
+      console.warn("Firestore user cams setup err:", e);
+    }
+
+    // 2. Firestore: /cameras
+    try {
+      const rootCamsRef = collection(db, "cameras");
+      const qUser = query(rootCamsRef, where("userId", "==", uid));
+      const unsubRoot = onSnapshot(qUser, (snap) => {
+        snap.docs.forEach(d => processItem(d.id, d.data(), 'firestore'));
+        snap.docChanges().forEach(ch => {
+          if (ch.type === 'removed') {
+            const current = camerasStoreRef.current.get(ch.doc.id);
+            if (current && current.source !== 'manual') {
+              camerasStoreRef.current.delete(ch.doc.id);
+              updateState();
+            }
+          }
+        });
+      }, err => console.warn("Firestore /cameras listener:", err));
+      unsubs.push(unsubRoot);
+
+      if (userEmail) {
+        const qEmail = query(rootCamsRef, where("userEmail", "==", userEmail));
+        const unsubEmail = onSnapshot(qEmail, (snap) => {
+          snap.docs.forEach(d => processItem(d.id, d.data(), 'firestore'));
+        }, err => console.warn("Firestore /cameras email listener:", err));
+        unsubs.push(unsubEmail);
+      }
+    } catch (e) {
+      console.warn("Firestore root cams setup err:", e);
+    }
+
+    // 3. Realtime Database: /users/{userId}/cameras
+    try {
+      if (rtdb) {
+        const userRtdbRef = ref(rtdb, `users/${uid}/cameras`);
+        const unsubRtdbUser = onValue(userRtdbRef, (snap) => {
+          const val = snap.val();
+          if (val) {
+            Object.keys(val).forEach(k => processItem(k, val[k], 'rtdb-user'));
+          }
+        }, err => console.warn("RTDB user cameras error:", err));
+        unsubs.push(() => off(userRtdbRef));
+
+        // 4. Realtime Database: /cameras
+        const rootRtdbRef = ref(rtdb, `cameras`);
+        const unsubRtdbRoot = onValue(rootRtdbRef, (snap) => {
+          const val = snap.val();
+          if (val) {
+            Object.keys(val).forEach(k => processItem(k, val[k], 'rtdb'));
+          }
+        }, err => console.warn("RTDB root cameras error:", err));
+        unsubs.push(() => off(rootRtdbRef));
+      }
+    } catch (e) {
+      console.warn("RTDB setup err:", e);
+    }
+
+    return () => {
+      unsubs.forEach(u => u());
+    };
+  };
+
+  const fetchUserSessions = (uid: string) => {
+    try {
+      const q = query(collection(db, "sessions"), where("hostId", "==", uid));
+      return onSnapshot(q, (snapshot) => {
+        const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setActiveSessions(sessions);
+      }, (err) => {
+        console.warn("Sessions snapshot error:", err);
+      });
+    } catch (err) {
+      console.warn("Sessions query error:", err);
+    }
+  };
+
+  const deleteAndroidCamera = async (cam: AndroidCamera, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user) return;
+    try {
+      // 1. Remove from localStorage
+      const manuals = getStoredManualCameras(user.uid).filter(c => c.id !== cam.id);
+      saveStoredManualCameras(user.uid, manuals);
+
+      // 2. Remove from active store and state immediately
+      camerasStoreRef.current.delete(cam.id);
+      setAndroidCameras(Array.from(camerasStoreRef.current.values()));
+
+      // 3. Best-effort async delete from RTDB
+      if (rtdb) {
+        remove(ref(rtdb, `users/${user.uid}/cameras/${cam.id}`)).catch(() => {});
+        remove(ref(rtdb, `cameras/${cam.id}`)).catch(() => {});
+      }
+
+      // 4. Best-effort async delete from Firestore
+      deleteDoc(doc(db, "users", user.uid, "cameras", cam.id)).catch(() => {});
+      deleteDoc(doc(db, "cameras", cam.id)).catch(() => {});
+    } catch (err) {
+      console.error("Error removing camera:", err);
+    }
+  };
+
+  const handleAddManualCamera = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !manualIp) return;
+
+    const camId = `cam_${Date.now()}`;
+    const cleanIp = manualIp.trim();
+    const cleanPort = manualPort.trim() || '8080';
+    const streamUrl = `http://${cleanIp}:${cleanPort}`;
+    const nowIso = new Date().toISOString();
+
+    const camData: AndroidCamera = {
+      id: camId,
+      name: manualName.trim() || `Android IP ${cleanIp}`,
+      ipAddress: cleanIp,
+      port: Number(cleanPort) || 8080,
+      streamUrl: streamUrl,
+      isOnline: true,
+      status: 'online',
+      userId: user.uid,
+      userEmail: user.email || undefined,
+      updatedAt: nowIso,
+      source: 'manual'
+    };
+
+    // 1. Store in local state & localStorage so the UI updates reliably and immediately
+    const manuals = getStoredManualCameras(user.uid);
+    manuals.push(camData);
+    saveStoredManualCameras(user.uid, manuals);
+    camerasStoreRef.current.set(camId, camData);
+    setAndroidCameras(Array.from(camerasStoreRef.current.values()));
+
+    // 2. Best-effort sync to Realtime Database
+    if (rtdb) {
+      try {
+        set(ref(rtdb, `users/${user.uid}/cameras/${camId}`), {
+          ...camData,
+          updatedAt: nowIso
+        }).catch((err) => console.warn("RTDB manual save notice:", err));
+      } catch (err) {
+        console.warn("RTDB manual camera notice:", err);
+      }
+    }
+
+    // 3. Best-effort sync to Firestore (silently handled if cloud permissions are restricted)
+    try {
+      setDoc(doc(db, "users", user.uid, "cameras", camId), {
+        ...camData,
+        updatedAt: serverTimestamp()
+      }).catch((err) => console.warn("Firestore user camera write notice:", err));
+    } catch (err) {
+      console.warn("Firestore manual camera save notice:", err);
+    }
+
+    setManualIp('');
+    setManualName('');
+    setManualPort('8080');
+    setShowAddManualModal(false);
+  };
+
 
   const handleLogout = () => {
     cleanupSession();
@@ -845,6 +1124,19 @@ const App: React.FC = () => {
     );
   }
 
+  // --- RENDER: ANDROID CAMERA VIEWER ---
+  if (mode === AppMode.ANDROID_VIEWER && selectedAndroidCamera) {
+    return (
+      <AndroidCameraViewer 
+        camera={selectedAndroidCamera} 
+        onBack={() => {
+          setSelectedAndroidCamera(null);
+          setMode(AppMode.SELECT);
+        }} 
+      />
+    );
+  }
+
   // --- RENDER: TIMELINE ---
   if (mode === AppMode.TIMELINE) {
     return (
@@ -855,6 +1147,7 @@ const App: React.FC = () => {
         />
     );
   }
+
 
   // --- RENDER: VIEWER (Monitor) ---
   if (mode === AppMode.VIEWER) {
@@ -1095,115 +1388,399 @@ const App: React.FC = () => {
   }
 
   // --- RENDER: DASHBOARD ---
+  const filteredAndroidCameras = catalogFilter === 'p2p' ? [] : androidCameras;
+  const filteredSessions = catalogFilter === 'android' ? [] : activeSessions;
+  const totalDeviceCount = androidCameras.length + activeSessions.length;
+
+  const renderBatteryIcon = (battery?: number, charging?: boolean) => {
+    if (charging) return <BatteryCharging size={15} className="text-yellow-400" />;
+    if (battery === undefined || battery === null) return <Battery size={15} className="text-secondary" />;
+    if (battery <= 20) return <BatteryLow size={15} className="text-red-400" />;
+    if (battery <= 50) return <BatteryMedium size={15} className="text-yellow-400" />;
+    return <Battery size={15} className="text-green-400" />;
+  };
+
+  const copyUrl = (id: string, url?: string, ip?: string, port?: number | string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const finalUrl = url || (ip ? `http://${ip}:${port || 8080}` : '');
+    if (!finalUrl) return;
+    navigator.clipboard.writeText(finalUrl);
+    setCopiedCamId(id);
+    setTimeout(() => setCopiedCamId(null), 2000);
+  };
+
   return (
-    <div className="min-h-screen bg-background text-primary p-6">
+    <div className="min-h-screen bg-background text-primary p-4 sm:p-6">
         {showScanner && <Scanner onClose={() => setShowScanner(false)} onScan={(id) => { setShowScanner(false); startCamera(id); }} />}
 
-        <header className="flex justify-between items-center mb-8 mt-2">
+        {/* Manual Camera Modal */}
+        {showAddManualModal && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-surface border border-white/10 p-6 rounded-2xl max-w-md w-full shadow-2xl">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-base font-medium text-white">Adicionar Câmera IP Manual</h3>
+                <button 
+                  onClick={() => setShowAddManualModal(false)}
+                  className="p-1 rounded-lg text-secondary hover:text-white hover:bg-white/5 transition-colors"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <p className="text-xs text-secondary mb-4 leading-relaxed">
+                Digite o IP e porta da câmera gerados pelo aplicativo Android PS Cam na sua rede local.
+              </p>
+
+              <form onSubmit={handleAddManualCamera} className="space-y-3.5">
+                <div>
+                  <label className="text-xs text-secondary block mb-1">Nome da Câmera</label>
+                  <input
+                    type="text"
+                    placeholder="Ex: Câmera Quarto, Galaxy S21"
+                    value={manualName}
+                    onChange={(e) => setManualName(e.target.value)}
+                    className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="col-span-2">
+                    <label className="text-xs text-secondary block mb-1">Endereço IP</label>
+                    <input
+                      type="text"
+                      placeholder="Ex: 192.168.1.105"
+                      value={manualIp}
+                      onChange={(e) => setManualIp(e.target.value)}
+                      className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs text-secondary block mb-1">Porta</label>
+                    <input
+                      type="text"
+                      placeholder="8080"
+                      value={manualPort}
+                      onChange={(e) => setManualPort(e.target.value)}
+                      className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="flex gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowAddManualModal(false)}
+                    className="flex-1 py-2.5 rounded-xl bg-surfaceLight text-secondary hover:text-white text-xs font-medium transition-colors"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 py-2.5 rounded-xl bg-white text-black hover:bg-zinc-200 text-xs font-medium transition-colors"
+                  >
+                    Salvar Câmera
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        <header className="flex justify-between items-center mb-8 mt-2 max-w-4xl mx-auto">
             <div className="flex items-center gap-3.5">
                 <img src="/ps-cam.png" alt="PS Cam" className="w-12 h-12 rounded-2xl border border-white/10 shadow-md object-contain" referrerPolicy="no-referrer" />
                 <div>
                     <h1 className="text-xl font-medium tracking-tight text-white flex items-center gap-1">PS<span className="text-sky-400">.</span>Cam</h1>
-                    <p className="text-secondary text-xs">Welcome, {user.displayName}</p>
+                    <p className="text-secondary text-xs">{user.email || user.displayName}</p>
                 </div>
             </div>
-            <button onClick={handleLogout} className="p-2 bg-surfaceLight rounded-full text-secondary hover:text-white transition-colors" title="Logout">
+            <button onClick={handleLogout} className="p-2.5 bg-surfaceLight hover:bg-white/10 rounded-xl text-secondary hover:text-white transition-colors" title="Logout">
                 <LogOut size={18} />
             </button>
         </header>
 
         {globalError && (
-             <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-danger text-sm flex items-center gap-3">
+             <div className="max-w-4xl mx-auto mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-danger text-sm flex items-center gap-3">
                 <AlertCircle size={18} /> {globalError}
             </div>
         )}
 
-        <div className="max-w-4xl mx-auto grid gap-8">
-            <div className="grid grid-cols-2 gap-4">
+        <div className="max-w-4xl mx-auto grid gap-6">
+            {/* Quick Action Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5">
                 <button 
                     onClick={() => {
-                        // Antes de iniciar o viewer, tenta conectar ao Drive
                         if(!googleAccessToken) {
                             connectToDrive().then(() => startViewer());
                         } else {
                             startViewer();
                         }
                     }} 
-                    className="h-32 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-3 group active:scale-[0.98]"
+                    className="p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
                 >
-                    <div className="p-3 rounded-full bg-white/5 group-hover:bg-white/10 transition-colors">
-                        <Eye size={24} className="text-white" />
+                    <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
+                        <Eye size={20} className="text-white" />
                     </div>
-                    <span className="text-sm font-medium text-secondary group-hover:text-white">New Monitor</span>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white">Novo Monitor Web</span>
                 </button>
 
                 <button 
                     onClick={() => setShowScanner(true)}
-                    className="h-32 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-3 group active:scale-[0.98]"
+                    className="p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
                 >
-                    <div className="p-3 rounded-full bg-white/5 group-hover:bg-white/10 transition-colors">
-                        <Camera size={24} className="text-white" />
+                    <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
+                        <Camera size={20} className="text-white" />
                     </div>
-                    <span className="text-sm font-medium text-secondary group-hover:text-white">Connect Camera</span>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white">Conectar Câmera Web</span>
+                </button>
+
+                <button 
+                    onClick={() => setShowAddManualModal(true)}
+                    className="col-span-2 sm:col-span-1 p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
+                >
+                    <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
+                        <Plus size={20} className="text-white" />
+                    </div>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white">Adicionar IP Manual</span>
                 </button>
             </div>
 
-            {/* Timeline Button */}
+            {/* Video Timeline Card */}
             <button 
                 onClick={() => setMode(AppMode.TIMELINE)}
-                className="w-full bg-surface border border-white/5 hover:bg-surfaceLight transition-colors p-4 rounded-xl flex items-center justify-between group active:scale-[0.99]"
+                className="w-full bg-surface border border-white/5 hover:bg-surfaceLight transition-colors p-4 rounded-2xl flex items-center justify-between group active:scale-[0.99]"
             >
-                <div className="flex items-center gap-4">
-                    <div className="w-10 h-10 rounded-full bg-blue-500/10 text-blue-400 flex items-center justify-center">
-                        <Film size={20} />
+                <div className="flex items-center gap-3.5">
+                    <div className="w-10 h-10 rounded-xl bg-sky-500/10 text-sky-400 flex items-center justify-center">
+                        <Film size={18} />
                     </div>
                     <div className="text-left">
-                        <h3 className="text-sm font-medium text-white">Video Timeline</h3>
-                        <p className="text-xs text-secondary mt-0.5">View recordings saved in Google Drive</p>
+                        <h3 className="text-sm font-medium text-white">Linha do Tempo (Google Drive)</h3>
+                        <p className="text-xs text-secondary mt-0.5">Gravações automáticas salvas na nuvem</p>
                     </div>
                 </div>
                 <ArrowRight size={18} className="text-secondary group-hover:text-white transition-colors" />
             </button>
 
+            {/* Catalogue Section */}
             <div>
-                <h2 className="text-sm font-medium text-secondary uppercase tracking-wider mb-4 flex items-center gap-2">
-                    <RefreshCw size={14} /> Active Devices
-                </h2>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                    <div className="flex items-center gap-2">
+                        <h2 className="text-sm font-medium text-secondary uppercase tracking-wider flex items-center gap-2">
+                            <RefreshCw size={14} className="text-sky-400" /> Catálogo de Câmeras Conectadas
+                        </h2>
+                        <span className="px-2 py-0.5 rounded-full bg-surfaceLight border border-white/5 text-[11px] text-white font-mono">
+                          {totalDeviceCount}
+                        </span>
+                    </div>
+
+                    {/* Filter Tabs */}
+                    <div className="flex items-center gap-1.5 p-1 rounded-xl bg-surface border border-white/5 text-xs font-medium">
+                        <button
+                          onClick={() => setCatalogFilter('all')}
+                          className={`px-3 py-1 rounded-lg transition-colors ${
+                            catalogFilter === 'all' 
+                              ? 'bg-white text-black font-semibold' 
+                              : 'text-secondary hover:text-white'
+                          }`}
+                        >
+                          Todas ({totalDeviceCount})
+                        </button>
+                        <button
+                          onClick={() => setCatalogFilter('android')}
+                          className={`px-3 py-1 rounded-lg transition-colors ${
+                            catalogFilter === 'android' 
+                              ? 'bg-white text-black font-semibold' 
+                              : 'text-secondary hover:text-white'
+                          }`}
+                        >
+                          Android App ({androidCameras.length})
+                        </button>
+                        <button
+                          onClick={() => setCatalogFilter('p2p')}
+                          className={`px-3 py-1 rounded-lg transition-colors ${
+                            catalogFilter === 'p2p' 
+                              ? 'bg-white text-black font-semibold' 
+                              : 'text-secondary hover:text-white'
+                          }`}
+                        >
+                          Web P2P ({activeSessions.length})
+                        </button>
+                    </div>
+                </div>
                 
                 <div className="space-y-3">
-                    {activeSessions.length === 0 ? (
-                        <div className="p-8 rounded-2xl border border-dashed border-white/10 text-center text-secondary text-sm">
-                            No active monitors found.
-                        </div>
-                    ) : (
-                        activeSessions.map(session => (
-                            <div key={session.id} onClick={() => startViewer(session.id)} className="group bg-surface hover:bg-surfaceLight transition-colors p-4 rounded-xl border border-white/5 flex items-center justify-between cursor-pointer active:scale-[0.99]">
-                                <div className="flex items-center gap-4">
-                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center ${session.status === 'active' ? 'bg-green-500/10 text-green-500' : 'bg-white/5 text-secondary'}`}>
-                                        <Smartphone size={20} />
-                                    </div>
-                                    <div>
-                                        <h3 className="text-sm font-medium text-white">{session.deviceName || 'Camera Device'}</h3>
-                                        <p className="text-xs text-secondary mt-0.5">
-                                            {session.status === 'active' ? '● Streaming (P2P)' : '○ Ready to connect'}
-                                        </p>
-                                    </div>
-                                </div>
-                                <button onClick={(e) => deleteSession(session.id, e)} className="p-2 text-secondary hover:text-danger opacity-0 group-hover:opacity-100 transition-all">
-                                    <Trash2 size={16} />
+                    {/* Android App Cameras */}
+                    {filteredAndroidCameras.map(cam => {
+                      const isCamOnline = cam.isOnline || cam.status === 'online';
+                      const rawUrl = cam.streamUrl || (cam.ipAddress ? `http://${cam.ipAddress}:${cam.port || 8080}` : '');
+
+                      return (
+                        <div 
+                          key={`android-${cam.id}`} 
+                          onClick={() => {
+                            setSelectedAndroidCamera(cam);
+                            setMode(AppMode.ANDROID_VIEWER);
+                          }}
+                          className="group bg-surface hover:bg-surfaceLight transition-colors p-4 rounded-2xl border border-white/5 hover:border-white/15 flex flex-col sm:flex-row sm:items-center justify-between gap-4 cursor-pointer active:scale-[0.99]"
+                        >
+                          <div className="flex items-center gap-3.5">
+                              <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${
+                                isCamOnline ? 'bg-green-500/10 text-green-400 border border-green-500/20' : 'bg-white/5 text-secondary'
+                              }`}>
+                                  <Smartphone size={20} />
+                              </div>
+
+                              <div>
+                                  <div className="flex items-center gap-2.5">
+                                      <h3 className="text-sm font-medium text-white group-hover:text-sky-400 transition-colors">
+                                        {cam.name || 'Android PS Cam'}
+                                      </h3>
+
+                                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                                        isCamOnline 
+                                          ? 'bg-green-500/10 text-green-400 border border-green-500/20' 
+                                          : 'bg-zinc-800 text-zinc-400'
+                                      }`}>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${isCamOnline ? 'bg-green-400 animate-pulse' : 'bg-zinc-500'}`}></span>
+                                        {isCamOnline ? 'Online' : 'Offline'}
+                                      </span>
+
+                                      <span className="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20 text-[10px] font-medium">
+                                        Android IP
+                                      </span>
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-secondary mt-1">
+                                      <span className="font-mono text-zinc-300">{rawUrl || 'http://192.168.x.x'}</span>
+                                      
+                                      {cam.battery !== undefined && (
+                                        <span className="flex items-center gap-1 text-zinc-300">
+                                          {renderBatteryIcon(cam.battery, cam.batteryCharging)}
+                                          <span>{cam.battery}%</span>
+                                        </span>
+                                      )}
+                                  </div>
+                              </div>
+                          </div>
+
+                          {/* Quick Action buttons */}
+                          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                              <button
+                                onClick={(e) => copyUrl(cam.id, cam.streamUrl, cam.ipAddress, cam.port, e)}
+                                className="p-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white transition-colors text-xs flex items-center gap-1.5"
+                                title="Copiar URL do Stream"
+                              >
+                                {copiedCamId === cam.id ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                                <span className="hidden md:inline">{copiedCamId === cam.id ? 'Copiado' : 'Copiar'}</span>
+                              </button>
+
+                              {rawUrl && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    window.open(rawUrl, '_blank', 'noopener,noreferrer');
+                                  }}
+                                  className="p-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white transition-colors text-xs flex items-center gap-1.5"
+                                  title="Abrir em Nova Aba"
+                                >
+                                  <ExternalLink size={14} />
+                                  <span className="hidden md:inline">Aba</span>
                                 </button>
+                              )}
+
+                              <button 
+                                onClick={() => {
+                                  setSelectedAndroidCamera(cam);
+                                  setMode(AppMode.ANDROID_VIEWER);
+                                }} 
+                                className="px-3 py-2 rounded-xl bg-white text-black hover:bg-zinc-200 transition-colors text-xs font-medium flex items-center gap-1.5"
+                              >
+                                <Eye size={14} />
+                                <span>Assistir</span>
+                              </button>
+
+                              <button 
+                                onClick={(e) => deleteAndroidCamera(cam, e)} 
+                                className="p-2 text-secondary hover:text-danger rounded-xl hover:bg-danger/10 transition-colors"
+                                title="Remover câmera"
+                              >
+                                  <Trash2 size={15} />
+                              </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {/* Web P2P Sessions */}
+                    {filteredSessions.map(session => (
+                        <div 
+                          key={`session-${session.id}`} 
+                          onClick={() => startViewer(session.id)} 
+                          className="group bg-surface hover:bg-surfaceLight transition-colors p-4 rounded-2xl border border-white/5 hover:border-white/15 flex items-center justify-between cursor-pointer active:scale-[0.99]"
+                        >
+                            <div className="flex items-center gap-3.5">
+                                <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${session.status === 'active' ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-white/5 text-secondary'}`}>
+                                    <Smartphone size={20} />
+                                </div>
+                                <div>
+                                    <div className="flex items-center gap-2">
+                                      <h3 className="text-sm font-medium text-white">{session.deviceName || 'Camera Web P2P'}</h3>
+                                      <span className="px-2 py-0.5 rounded-full bg-white/5 border border-white/5 text-[10px] text-secondary font-medium">
+                                        Web P2P
+                                      </span>
+                                    </div>
+                                    <p className="text-xs text-secondary mt-0.5">
+                                        {session.status === 'active' ? '● Transmissão Ativa (P2P)' : '○ Pronto para Conectar'}
+                                    </p>
+                                </div>
                             </div>
-                        ))
+
+                            <div className="flex items-center gap-2">
+                              <button 
+                                onClick={() => startViewer(session.id)} 
+                                className="px-3 py-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-white transition-colors text-xs font-medium"
+                              >
+                                Conectar
+                              </button>
+                              <button 
+                                onClick={(e) => deleteSession(session.id, e)} 
+                                className="p-2 text-secondary hover:text-danger rounded-xl hover:bg-danger/10 transition-colors"
+                                title="Remover sessão"
+                              >
+                                  <Trash2 size={15} />
+                              </button>
+                            </div>
+                        </div>
+                    ))}
+
+                    {/* Empty State */}
+                    {filteredAndroidCameras.length === 0 && filteredSessions.length === 0 && (
+                        <div className="p-8 rounded-2xl border border-dashed border-white/10 text-center">
+                            <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-white/5 text-secondary flex items-center justify-center">
+                              <Smartphone size={22} />
+                            </div>
+                            <h3 className="text-sm font-medium text-white mb-1">Nenhuma câmera conectada</h3>
+                            <p className="text-xs text-secondary max-w-md mx-auto leading-relaxed">
+                              Abra o aplicativo Android PS Cam com a sua conta <span className="text-white font-mono">{user.email || user.displayName}</span> para que o dispositivo seja sincronizado e apareça automaticamente aqui em tempo real.
+                            </p>
+                        </div>
                     )}
                 </div>
             </div>
 
-            <div className="mt-4 p-4 rounded-xl bg-surfaceLight/30 border border-white/5 flex items-start gap-3">
-                <HardDrive size={18} className="text-secondary shrink-0 mt-0.5" />
+            {/* Android App Sync Notice */}
+            <div className="p-4 rounded-2xl bg-surface border border-white/5 flex items-start gap-3.5">
+                <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400 shrink-0 mt-0.5">
+                  <ShieldCheck size={18} />
+                </div>
                 <div>
-                    <h4 className="text-sm font-medium text-white">PeerJS Mode Active</h4>
+                    <h4 className="text-xs font-medium text-white">Sincronização em Tempo Real (Firebase PS Cam)</h4>
                     <p className="text-xs text-secondary mt-1 leading-relaxed">
-                        Using PeerJS public cloud for signaling. Video is encrypted and transferred directly between devices (P2P). No video data touches any server.
+                      O catálogo está conectado ao Firebase Firestore e Realtime Database. Câmeras ativadas no seu aplicativo Android PS Cam transmitem status, bateria, endereço IP e URL de stream instantaneamente para esta conta.
                     </p>
                 </div>
             </div>

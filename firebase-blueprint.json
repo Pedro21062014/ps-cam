@@ -1,0 +1,110 @@
+{
+  "entities": {
+    "Camera": {
+      "title": "Camera",
+      "description": "An Android camera or IP camera device registered to a user",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the camera"
+        },
+        "name": {
+          "type": "string",
+          "description": "Friendly name of the camera"
+        },
+        "ipAddress": {
+          "type": "string",
+          "description": "Local IP address of the camera stream"
+        },
+        "port": {
+          "type": "number",
+          "description": "Port number of the camera stream"
+        },
+        "streamUrl": {
+          "type": "string",
+          "description": "Full HTTP or HTTPS stream URL"
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Whether the camera stream is currently active"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status of the camera (online/offline)"
+        },
+        "battery": {
+          "type": "number",
+          "description": "Battery percentage level (0-100)"
+        },
+        "batteryCharging": {
+          "type": "boolean",
+          "description": "Whether battery is currently charging"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user UID"
+        },
+        "userEmail": {
+          "type": "string",
+          "description": "Owner user email address"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Timestamp when the camera state was last updated"
+        },
+        "source": {
+          "type": "string",
+          "description": "Origin source of the camera metadata"
+        }
+      },
+      "required": ["id", "userId"]
+    },
+    "Session": {
+      "title": "Session",
+      "description": "WebRTC Web P2P camera session",
+      "type": "object",
+      "properties": {
+        "hostId": {
+          "type": "string",
+          "description": "Host user UID"
+        },
+        "peerId": {
+          "type": "string",
+          "description": "PeerJS ID of the viewer"
+        },
+        "cameraId": {
+          "type": "string",
+          "description": "PeerJS ID or UID of the transmitting camera"
+        },
+        "status": {
+          "type": "string",
+          "description": "Session status (waiting, active, disconnected)"
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Device name"
+        },
+        "motionDetected": {
+          "type": "boolean",
+          "description": "Whether motion was triggered"
+        }
+      },
+      "required": ["hostId"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/cameras/{cameraId}": {
+      "schema": "Camera",
+      "description": "User specific registered cameras"
+    },
+    "/cameras/{cameraId}": {
+      "schema": "Camera",
+      "description": "Global camera catalog indexed by ID"
+    },
+    "/sessions/{sessionId}": {
+      "schema": "Session",
+      "description": "WebRTC active signalling sessions"
+    }
+  }
+}

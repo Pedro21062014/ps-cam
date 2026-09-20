@@ -10,7 +10,25 @@ export enum AppMode {
   VIEWER = 'VIEWER',
   CAMERA = 'CAMERA',
   SCAN = 'SCAN',
-  TIMELINE = 'TIMELINE'
+  TIMELINE = 'TIMELINE',
+  ANDROID_VIEWER = 'ANDROID_VIEWER'
+}
+
+export interface AndroidCamera {
+  id: string;
+  name: string;
+  ipAddress?: string;
+  port?: number | string;
+  streamUrl?: string; // Format: http://IP:PORT
+  isOnline?: boolean;
+  status?: 'online' | 'offline' | string;
+  battery?: number;
+  batteryCharging?: boolean;
+  userId?: string;
+  userEmail?: string;
+  lastSeen?: any;
+  updatedAt?: any;
+  source?: 'firestore' | 'rtdb' | 'firestore-user' | 'rtdb-user' | 'manual';
 }
 
 export interface CameraCommand {

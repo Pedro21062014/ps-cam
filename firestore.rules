@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // User-specific Cameras: /users/{userId}/cameras/{cameraId}
+    match /users/{userId}/cameras/{cameraId} {
+      allow read, write, delete: if isOwner(userId);
+    }
+
+    // Root Cameras: /cameras/{cameraId}
+    match /cameras/{cameraId} {
+      allow read: if isSignedIn() && (
+        resource == null || 
+        resource.data.userId == request.auth.uid || 
+        (resource.data.userEmail != null && request.auth.token.email != null && resource.data.userEmail == request.auth.token.email)
+      );
+      allow create, update: if isSignedIn() && (
+        request.resource.data.userId == request.auth.uid || 
+        (request.resource.data.userEmail != null && request.auth.token.email != null && request.resource.data.userEmail == request.auth.token.email)
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || 
+        (resource.data.userEmail != null && request.auth.token.email != null && resource.data.userEmail == request.auth.token.email)
+      );
+    }
+
+    // WebRTC Signalling Sessions: /sessions/{sessionId}
+    match /sessions/{sessionId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.hostId == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (resource == null || resource.data.hostId == request.auth.uid);
+    }
+  }
+}
