@@ -22,14 +22,14 @@ import {
   deleteDoc,
   getDoc
 } from "firebase/firestore";
-import { ref, onValue, off, set, remove } from "firebase/database";
+import { ref, onValue, off, set, remove, get } from "firebase/database";
 import { UserProfile, AppMode, CameraCommand, AndroidCamera } from './types';
 import { 
   Camera, Eye, LogOut, Zap, Bell, StopCircle, 
   HardDrive, QrCode, Mail, Lock, User, ArrowRight, 
   AlertCircle, Smartphone, RefreshCw, Trash2, Volume2, VolumeX,
   Wifi, Loader2, Activity, Disc, CheckCircle, Cloud, Film, Moon, Sun, SwitchCamera, Link, Infinity,
-  Monitor, Settings2, UploadCloud, Radio, Battery, BatteryCharging, BatteryLow, BatteryMedium, ExternalLink, Copy, Check, ShieldCheck, Plus
+  Monitor, Settings2, UploadCloud, Radio, Battery, BatteryCharging, BatteryLow, BatteryMedium, ExternalLink, Copy, Check, ShieldCheck, Plus, KeyRound, Hash, Globe
 } from 'lucide-react';
 import QRCode from 'react-qr-code';
 import Scanner from './components/Scanner';
@@ -89,6 +89,11 @@ const App: React.FC = () => {
   const [manualPort, setManualPort] = useState('8080');
   const [manualName, setManualName] = useState('');
   const [showScanner, setShowScanner] = useState(false);
+  
+  // PIN Pairing States
+  const [pinInput, setPinInput] = useState('');
+  const [pinLoading, setPinLoading] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
   
   // Store reference to consolidate cameras from multiple Firebase sources
   const camerasStoreRef = useRef<Map<string, AndroidCamera>>(new Map());
@@ -412,6 +417,126 @@ const App: React.FC = () => {
     setManualName('');
     setManualPort('8080');
     setShowAddManualModal(false);
+  };
+
+  const handlePinChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    let val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (val.length > 6) val = val.slice(0, 6);
+    if (val.length > 3) {
+      setPinInput(`${val.slice(0, 3)}-${val.slice(3)}`);
+    } else {
+      setPinInput(val);
+    }
+    if (pinError) setPinError(null);
+  };
+
+  const handleConnectPin = async (e?: React.FormEvent, customPin?: string) => {
+    if (e) e.preventDefault();
+    const rawPin = (customPin || pinInput).trim();
+    if (!rawPin) {
+      setPinError("Por favor, digite o código PIN de 6 dígitos.");
+      return;
+    }
+
+    const cleanPin = rawPin.toUpperCase().replace(/\s+/g, '');
+    const cleanWithoutHyphen = cleanPin.replace(/-/g, '');
+    const cleanWithHyphen = cleanPin.includes('-') 
+      ? cleanPin 
+      : (cleanPin.length === 6 ? `${cleanPin.slice(0, 3)}-${cleanPin.slice(3)}` : cleanPin);
+
+    setPinLoading(true);
+    setPinError(null);
+
+    try {
+      let foundData: any = null;
+      let matchedPinKey = cleanWithHyphen;
+
+      // 1. Query Firebase Realtime Database at /pins/{pin}
+      if (rtdb) {
+        try {
+          const snap1 = await get(ref(rtdb, `pins/${cleanWithHyphen}`));
+          if (snap1.exists()) {
+            foundData = snap1.val();
+            matchedPinKey = cleanWithHyphen;
+          } else {
+            const snap2 = await get(ref(rtdb, `pins/${cleanWithoutHyphen}`));
+            if (snap2.exists()) {
+              foundData = snap2.val();
+              matchedPinKey = cleanWithoutHyphen;
+            }
+          }
+        } catch (rtdbErr) {
+          console.warn("RTDB PIN lookup notice:", rtdbErr);
+        }
+      }
+
+      // 2. Query Firestore at /pins/{pin} if not found yet
+      if (!foundData) {
+        try {
+          const docSnap1 = await getDoc(doc(db, "pins", cleanWithHyphen));
+          if (docSnap1.exists()) {
+            foundData = docSnap1.data();
+            matchedPinKey = cleanWithHyphen;
+          } else {
+            const docSnap2 = await getDoc(doc(db, "pins", cleanWithoutHyphen));
+            if (docSnap2.exists()) {
+              foundData = docSnap2.data();
+              matchedPinKey = cleanWithoutHyphen;
+            }
+          }
+        } catch (firestoreErr) {
+          console.warn("Firestore PIN lookup notice:", firestoreErr);
+        }
+      }
+
+      // 3. Check locally known cameras for pin match
+      if (!foundData) {
+        const localMatch = Array.from(camerasStoreRef.current.values()).find(
+          c => c.pin === cleanWithHyphen || c.pin === cleanWithoutHyphen || c.id === cleanWithoutHyphen
+        );
+        if (localMatch) {
+          foundData = localMatch;
+        }
+      }
+
+      if (foundData) {
+        const targetDeviceId = foundData.deviceId || foundData.id || `cam_${cleanWithoutHyphen}`;
+        const ip = foundData.ipAddress || foundData.ip || '';
+        const port = foundData.port || 8080;
+        const streamUrl = foundData.streamUrl || (ip ? `http://${ip}:${port}/video` : undefined);
+
+        const cameraObj: AndroidCamera = {
+          id: targetDeviceId,
+          deviceId: targetDeviceId,
+          name: foundData.name || foundData.deviceName || `Câmera Android (${cleanWithHyphen})`,
+          ipAddress: ip,
+          port: port,
+          streamUrl: streamUrl,
+          isOnline: foundData.isOnline ?? true,
+          status: foundData.status || 'online',
+          battery: foundData.battery,
+          batteryCharging: foundData.batteryCharging,
+          pin: cleanWithHyphen,
+          userId: user?.uid,
+          updatedAt: new Date().toISOString(),
+          source: 'pin'
+        };
+
+        // Cache in camera store and select for immediate viewing
+        camerasStoreRef.current.set(cameraObj.id, cameraObj);
+        setAndroidCameras(Array.from(camerasStoreRef.current.values()));
+        setSelectedAndroidCamera(cameraObj);
+        setMode(AppMode.ANDROID_VIEWER);
+        setPinInput('');
+      } else {
+        setPinError(`Nenhuma câmera encontrada com o PIN "${cleanWithHyphen}". Verifique se o app Android PS Cam está aberto e transmitindo o PIN.`);
+      }
+    } catch (err: any) {
+      console.error("PIN connection error:", err);
+      setPinError("Falha ao consultar o PIN no Firebase. Verifique a conexão.");
+    } finally {
+      setPinLoading(false);
+    }
   };
 
 
@@ -1509,6 +1634,52 @@ const App: React.FC = () => {
         )}
 
         <div className="max-w-4xl mx-auto grid gap-6">
+            {/* PIN Code Pairing Section */}
+            <div className="bg-surface border border-white/10 p-5 rounded-2xl shadow-xl">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3.5">
+                        <div className="w-11 h-11 rounded-xl bg-sky-500/10 text-sky-400 border border-sky-500/20 flex items-center justify-center shrink-0">
+                            <KeyRound size={22} />
+                        </div>
+                        <div>
+                            <h3 className="text-sm font-medium text-white">Emparelhar por Código PIN</h3>
+                            <p className="text-xs text-secondary mt-0.5">
+                                Digite o PIN de 6 dígitos exibido no aplicativo Android PS Cam (ex: <span className="text-zinc-300 font-mono font-medium">489-123</span>)
+                            </p>
+                        </div>
+                    </div>
+
+                    <form onSubmit={handleConnectPin} className="flex items-center gap-2.5 w-full sm:w-auto">
+                        <div className="relative flex-1 sm:w-44">
+                            <input
+                                type="text"
+                                maxLength={7}
+                                placeholder="000-000"
+                                value={pinInput}
+                                onChange={handlePinChange}
+                                className="w-full bg-surfaceLight border border-white/10 rounded-xl px-3.5 py-2.5 text-center text-sm font-mono font-bold tracking-widest text-white placeholder-secondary/40 outline-none focus:border-sky-400 transition-colors uppercase"
+                            />
+                        </div>
+
+                        <button
+                            type="submit"
+                            disabled={pinLoading || !pinInput.trim()}
+                            className="px-4 py-2.5 rounded-xl bg-white text-black hover:bg-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors shrink-0"
+                        >
+                            {pinLoading ? <Loader2 size={14} className="animate-spin" /> : <ArrowRight size={14} />}
+                            <span>Conectar</span>
+                        </button>
+                    </form>
+                </div>
+
+                {pinError && (
+                    <div className="mt-3.5 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-danger text-xs flex items-center gap-2">
+                        <AlertCircle size={14} className="shrink-0" />
+                        <span>{pinError}</span>
+                    </div>
+                )}
+            </div>
+
             {/* Quick Action Cards */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5">
                 <button 

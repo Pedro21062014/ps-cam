@@ -37,6 +37,17 @@ service cloud.firestore {
       );
     }
 
+    // PIN matching: /pins/{pin}
+    match /pins/{pin} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
+    // Remote Commands: /commands/{deviceId}
+    match /commands/{deviceId} {
+      allow read, write: if isSignedIn();
+    }
+
     // WebRTC Signalling Sessions: /sessions/{sessionId}
     match /sessions/{sessionId} {
       allow read: if isSignedIn();
