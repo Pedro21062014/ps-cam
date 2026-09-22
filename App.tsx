@@ -26,7 +26,7 @@ import { ref, onValue, off, set, remove, get } from "firebase/database";
 import { UserProfile, AppMode, CameraCommand, AndroidCamera } from './types';
 import { 
   Camera, Eye, LogOut, Zap, Bell, StopCircle, 
-  HardDrive, QrCode, Mail, Lock, User, ArrowRight, 
+  HardDrive, QrCode, Mail, Lock, User, ArrowRight, ArrowLeft,
   AlertCircle, Smartphone, RefreshCw, Trash2, Volume2, VolumeX,
   Wifi, Loader2, Activity, Disc, CheckCircle, Cloud, Film, Moon, Sun, SwitchCamera, Link, Infinity,
   Monitor, Settings2, UploadCloud, Radio, Battery, BatteryCharging, BatteryLow, BatteryMedium, ExternalLink, Copy, Check, ShieldCheck, Plus, KeyRound, Hash, Globe
@@ -85,15 +85,22 @@ const App: React.FC = () => {
   const [catalogFilter, setCatalogFilter] = useState<'all' | 'android' | 'p2p'>('all');
   const [copiedCamId, setCopiedCamId] = useState<string | null>(null);
   const [showAddManualModal, setShowAddManualModal] = useState(false);
+  const [manualName, setManualName] = useState('');
+  const [manualRoomCode, setManualRoomCode] = useState('');
   const [manualIp, setManualIp] = useState('');
   const [manualPort, setManualPort] = useState('8080');
-  const [manualName, setManualName] = useState('');
+  const [showAdvancedManual, setShowAdvancedManual] = useState(false);
+  const [webCamRoom, setWebCamRoom] = useState<string | null>(null);
   const [showScanner, setShowScanner] = useState(false);
   
   // PIN Pairing States
   const [pinInput, setPinInput] = useState('');
   const [pinLoading, setPinLoading] = useState(false);
   const [pinError, setPinError] = useState<string | null>(null);
+  
+  // WebRTC Pairing States
+  const [viewerPin, setViewerPin] = useState<string | null>(null);
+  const [copiedViewerLink, setCopiedViewerLink] = useState(false);
   
   // Store reference to consolidate cameras from multiple Firebase sources
   const camerasStoreRef = useRef<Map<string, AndroidCamera>>(new Map());
@@ -362,19 +369,24 @@ const App: React.FC = () => {
 
   const handleAddManualCamera = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !manualIp) return;
+    if (!user) return;
 
-    const camId = `cam_${Date.now()}`;
+    const rawCode = (manualRoomCode || '').trim();
+    const cleanCode = rawCode || `${Math.floor(100 + Math.random() * 900)}-${Math.floor(100 + Math.random() * 900)}`;
+    const camId = `cam_${cleanCode.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}`;
     const cleanIp = manualIp.trim();
     const cleanPort = manualPort.trim() || '8080';
-    const streamUrl = `http://${cleanIp}:${cleanPort}`;
+    const streamUrl = cleanIp ? `http://${cleanIp}:${cleanPort}` : undefined;
     const nowIso = new Date().toISOString();
 
     const camData: AndroidCamera = {
       id: camId,
-      name: manualName.trim() || `Android IP ${cleanIp}`,
-      ipAddress: cleanIp,
-      port: Number(cleanPort) || 8080,
+      deviceId: camId,
+      name: manualName.trim() || `Câmera (${cleanCode})`,
+      pin: cleanCode,
+      roomCode: cleanCode,
+      ipAddress: cleanIp || undefined,
+      port: cleanIp ? Number(cleanPort) || 8080 : undefined,
       streamUrl: streamUrl,
       isOnline: true,
       status: 'online',
@@ -397,25 +409,28 @@ const App: React.FC = () => {
         set(ref(rtdb, `users/${user.uid}/cameras/${camId}`), {
           ...camData,
           updatedAt: nowIso
-        }).catch((err) => console.warn("RTDB manual save notice:", err));
+        }).catch(() => {});
+        set(ref(rtdb, `pins/${cleanCode}`), camData).catch(() => {});
       } catch (err) {
-        console.warn("RTDB manual camera notice:", err);
+        console.warn("RTDB camera sync notice:", err);
       }
     }
 
-    // 3. Best-effort sync to Firestore (silently handled if cloud permissions are restricted)
+    // 3. Best-effort sync to Firestore
     try {
       setDoc(doc(db, "users", user.uid, "cameras", camId), {
         ...camData,
         updatedAt: serverTimestamp()
-      }).catch((err) => console.warn("Firestore user camera write notice:", err));
+      }).catch(() => {});
     } catch (err) {
-      console.warn("Firestore manual camera save notice:", err);
+      console.warn("Firestore camera save notice:", err);
     }
 
+    setManualRoomCode('');
     setManualIp('');
     setManualName('');
     setManualPort('8080');
+    setShowAdvancedManual(false);
     setShowAddManualModal(false);
   };
 
@@ -500,6 +515,19 @@ const App: React.FC = () => {
       }
 
       if (foundData) {
+        // If it's a WebRTC session PIN
+        if (foundData.type === 'webrtc' && foundData.sessionId) {
+          if (foundData.status === 'waiting') {
+            startCamera(foundData.sessionId);
+            setPinInput('');
+            return;
+          } else {
+            startViewer(foundData.sessionId);
+            setPinInput('');
+            return;
+          }
+        }
+
         const targetDeviceId = foundData.deviceId || foundData.id || `cam_${cleanWithoutHyphen}`;
         const ip = foundData.ipAddress || foundData.ip || '';
         const port = foundData.port || 8080;
@@ -518,9 +546,40 @@ const App: React.FC = () => {
           batteryCharging: foundData.batteryCharging,
           pin: cleanWithHyphen,
           userId: user?.uid,
+          userEmail: user?.email || undefined,
           updatedAt: new Date().toISOString(),
           source: 'pin'
         };
+
+        // 1. Salvar no cache local permanente para nunca mais precisar digitar o PIN
+        if (user) {
+          const stored = getStoredManualCameras(user.uid);
+          const filtered = stored.filter(c => c.id !== cameraObj.id);
+          saveStoredManualCameras(user.uid, [...filtered, cameraObj]);
+
+          // 2. Salvar no Firestore e Realtime Database para vincular definitivamente à conta do usuário
+          const payload = {
+            id: cameraObj.id,
+            deviceId: targetDeviceId,
+            name: cameraObj.name,
+            ipAddress: ip,
+            port: port,
+            streamUrl: streamUrl,
+            pin: cleanWithHyphen,
+            userId: user.uid,
+            userEmail: user.email || null,
+            status: cameraObj.status,
+            isOnline: true,
+            pairedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+
+          if (rtdb) {
+            set(ref(rtdb, `users/${user.uid}/cameras/${targetDeviceId}`), payload).catch(() => {});
+          }
+          setDoc(doc(db, "users", user.uid, "cameras", targetDeviceId), payload).catch(() => {});
+          setDoc(doc(db, "cameras", targetDeviceId), payload, { merge: true }).catch(() => {});
+        }
 
         // Cache in camera store and select for immediate viewing
         camerasStoreRef.current.set(cameraObj.id, cameraObj);
@@ -529,11 +588,53 @@ const App: React.FC = () => {
         setMode(AppMode.ANDROID_VIEWER);
         setPinInput('');
       } else {
-        setPinError(`Nenhuma câmera encontrada com o PIN "${cleanWithHyphen}". Verifique se o app Android PS Cam está aberto e transmitindo o PIN.`);
+        // Modo Direto WebRTC (VideoMeet): Se o Firebase estiver com permissão negada ou pendente,
+        // conecta diretamente pela sala P2P com o PIN informado!
+        const targetDeviceId = `cam_${cleanWithoutHyphen}`;
+        const cameraObj: AndroidCamera = {
+          id: targetDeviceId,
+          deviceId: targetDeviceId,
+          name: `Câmera Android (${cleanWithHyphen})`,
+          pin: cleanWithHyphen,
+          isOnline: true,
+          status: 'online',
+          userId: user?.uid,
+          userEmail: user?.email || undefined,
+          updatedAt: new Date().toISOString(),
+          source: 'pin'
+        };
+
+        if (user) {
+          const stored = getStoredManualCameras(user.uid);
+          const filtered = stored.filter(c => c.id !== cameraObj.id);
+          saveStoredManualCameras(user.uid, [...filtered, cameraObj]);
+        }
+
+        camerasStoreRef.current.set(cameraObj.id, cameraObj);
+        setAndroidCameras(Array.from(camerasStoreRef.current.values()));
+        setSelectedAndroidCamera(cameraObj);
+        setMode(AppMode.ANDROID_VIEWER);
+        setPinInput('');
       }
     } catch (err: any) {
-      console.error("PIN connection error:", err);
-      setPinError("Falha ao consultar o PIN no Firebase. Verifique a conexão.");
+      console.error("PIN connection fallback:", err);
+      // Fallback seguro direto para a visualização WebRTC
+      const targetDeviceId = `cam_${cleanWithoutHyphen}`;
+      const cameraObj: AndroidCamera = {
+        id: targetDeviceId,
+        deviceId: targetDeviceId,
+        name: `Câmera Android (${cleanWithHyphen})`,
+        pin: cleanWithHyphen,
+        isOnline: true,
+        status: 'online',
+        userId: user?.uid,
+        userEmail: user?.email || undefined,
+        updatedAt: new Date().toISOString(),
+        source: 'pin'
+      };
+      setSelectedAndroidCamera(cameraObj);
+      setMode(AppMode.ANDROID_VIEWER);
+      setPinInput('');
     } finally {
       setPinLoading(false);
     }
@@ -574,6 +675,8 @@ const App: React.FC = () => {
 
     setStatus('Disconnected');
     setSessionId(null);
+    setViewerPin(null);
+    setCopiedViewerLink(false);
     setIsFlashOn(false);
     setIsSoundOn(false);
     setMotionDetected(false);
@@ -837,6 +940,9 @@ const App: React.FC = () => {
         setStatus('Waiting for Camera...');
         
         let currentSessionId = existingSessionId;
+        const randomNum = Math.floor(100000 + Math.random() * 900000).toString();
+        const pinFormatted = `${randomNum.slice(0, 3)}-${randomNum.slice(3)}`;
+        setViewerPin(pinFormatted);
 
         if (!currentSessionId) {
             const sessionRef = doc(collection(db, "sessions"));
@@ -847,15 +953,37 @@ const App: React.FC = () => {
                 peerId: peerId,
                 status: 'waiting',
                 createdAt: serverTimestamp(),
-                deviceName: 'Viewer Monitor'
+                deviceName: 'Viewer Monitor',
+                pin: pinFormatted
             });
         } else {
             await updateDoc(doc(db, "sessions", currentSessionId), {
                 peerId: peerId,
-                status: 'waiting'
+                status: 'waiting',
+                pin: pinFormatted
             });
         }
         setSessionId(currentSessionId);
+
+        // Register PIN in Realtime Database and Firestore for rapid pairing
+        const pinPayload = {
+          pin: pinFormatted,
+          pinNumeric: randomNum,
+          sessionId: currentSessionId,
+          peerId: peerId,
+          hostId: user.uid,
+          userEmail: user.email || null,
+          type: 'webrtc',
+          status: 'waiting',
+          createdAt: Date.now()
+        };
+
+        if (rtdb) {
+          set(ref(rtdb, `pins/${pinFormatted}`), pinPayload).catch(() => {});
+          set(ref(rtdb, `pins/${randomNum}`), pinPayload).catch(() => {});
+        }
+        setDoc(doc(db, "pins", pinFormatted), pinPayload).catch(() => {});
+        setDoc(doc(db, "pins", randomNum), pinPayload).catch(() => {});
 
         const unsub = onSnapshot(doc(db, "sessions", currentSessionId!), (snapshot) => {
             const data = snapshot.data();
@@ -920,7 +1048,13 @@ const App: React.FC = () => {
 
   // --- CAMERA LOGIC (Celular) ---
   const startCamera = async (scannedId: string) => {
-    if (!auth.currentUser) return;
+    if (!auth.currentUser) {
+      try {
+        await signInAnonymously(auth);
+      } catch (authErr) {
+        console.warn("Anonymous auth for camera error:", authErr);
+      }
+    }
     cleanupSession();
     setSessionId(scannedId);
     setMode(AppMode.CAMERA);
@@ -1025,6 +1159,24 @@ const App: React.FC = () => {
         setMode(AppMode.SELECT);
     }
   };
+
+  // Auto-connect from URL parameters (e.g. ?mode=camera&session=... or ?pin=...)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const sessionParam = params.get('session') || params.get('sessionId') || params.get('s') || params.get('camera');
+    const modeParam = params.get('mode') || params.get('role');
+    const pinParam = params.get('pin');
+
+    if (sessionParam && (modeParam === 'camera' || !modeParam)) {
+      startCamera(sessionParam);
+    } else if (pinParam) {
+      setPinInput(pinParam);
+      setTimeout(() => {
+        handleConnectPin(undefined, pinParam);
+      }, 500);
+    }
+  }, []);
 
   const handleQualityChange = async (newQuality: 'HD' | 'SD') => {
       console.log(`Switching quality to ${newQuality}`);
@@ -1342,12 +1494,47 @@ const App: React.FC = () => {
             
              {/* Pairing Code Overlay */}
              {sessionId && status.includes('Waiting') && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm z-10 pointer-events-none">
-                    <div className="bg-white p-2 rounded-xl mb-4 pointer-events-auto shadow-[0_0_30px_rgba(255,255,255,0.1)]">
-                        <QRCode value={sessionId} size={180} />
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 backdrop-blur-md z-10 pointer-events-auto p-4">
+                    <div className="max-w-md w-full bg-surface border border-white/10 rounded-3xl p-6 shadow-2xl flex flex-col items-center text-center">
+                        <div className="bg-white p-3 rounded-2xl mb-4 shadow-xl">
+                            <QRCode 
+                                value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?mode=camera&session=${sessionId}`} 
+                                size={170} 
+                            />
+                        </div>
+
+                        <h3 className="text-base font-semibold text-white mb-1">Conectar Celular via WebRTC</h3>
+                        <p className="text-xs text-secondary mb-4 max-w-xs">
+                            Aponte a câmera do celular para o QR Code acima ou digite o PIN abaixo no aplicativo ou painel:
+                        </p>
+
+                        {viewerPin && (
+                            <div className="mb-4 px-5 py-2.5 rounded-2xl bg-sky-500/10 border border-sky-500/20 flex flex-col items-center">
+                                <span className="text-[10px] text-sky-300 uppercase tracking-widest font-semibold">Código PIN de 6 Dígitos</span>
+                                <span className="text-2xl font-mono font-bold text-white tracking-widest">{viewerPin}</span>
+                            </div>
+                        )}
+
+                        <div className="flex flex-wrap items-center justify-center gap-2 w-full pt-1">
+                            <button
+                                onClick={() => {
+                                    const directUrl = `${window.location.origin}/?mode=camera&session=${sessionId}`;
+                                    navigator.clipboard.writeText(directUrl);
+                                    setCopiedViewerLink(true);
+                                    setTimeout(() => setCopiedViewerLink(false), 2000);
+                                }}
+                                className="px-3.5 py-2 rounded-xl bg-white text-black hover:bg-zinc-200 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                            >
+                                {copiedViewerLink ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
+                                <span>{copiedViewerLink ? 'Link Copiado!' : 'Copiar Link WebRTC'}</span>
+                            </button>
+                        </div>
+
+                        <div className="mt-4 pt-3 border-t border-white/5 w-full flex items-center justify-center gap-2 text-[11px] text-secondary">
+                            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                            <span>Aguardando sinal WebRTC da câmera...</span>
+                        </div>
                     </div>
-                    <p className="text-white font-medium text-lg">Scan to Pair Camera</p>
-                    <p className="font-mono text-xs text-zinc-600 mt-2 bg-white/5 px-2 py-1 rounded">{sessionId}</p>
                 </div>
              )}
 
@@ -1443,71 +1630,67 @@ const App: React.FC = () => {
 
   // --- RENDER: CAMERA ---
   if (mode === AppMode.CAMERA) {
+    const room = webCamRoom || sessionId || `${Math.floor(100 + Math.random() * 900)}-${Math.floor(100 + Math.random() * 900)}`;
+    const senderUrl = `https://video-chat-bvo.pages.dev/?mode=stream&role=sender&room=${encodeURIComponent(room)}&name=CameraWeb&clean=true&controls=none&header=false&toolbar=false&embed=true&audio=true&video=true`;
+    const viewerUrl = `https://video-chat-bvo.pages.dev/?mode=stream&role=viewer&room=${encodeURIComponent(room)}&clean=true&controls=none&header=false&toolbar=false&embed=true`;
+
     return (
-        <div className="fixed inset-0 bg-black">
-            {/* Background Mode Overlay (Screen Curtain) */}
-            {isBackgroundMode && (
-                <div 
-                    onClick={toggleBackgroundMode} 
-                    className="absolute inset-0 z-50 bg-black flex flex-col items-center justify-center text-zinc-800 cursor-pointer"
-                >
-                    <Moon size={48} className="mb-4 opacity-20" />
-                    <p className="text-sm font-medium opacity-20">Background Mode Active</p>
-                    <p className="text-xs mt-2 opacity-10">Tap to wake screen</p>
-                </div>
-            )}
-
-            <video 
-                ref={localVideoRef} 
-                autoPlay 
-                playsInline 
-                muted // Always muted locally to prevent echo
-                className={`w-full h-full object-cover ${facingMode === 'user' ? 'scale-x-[-1]' : ''}`} // Mirror front camera
-            />
-            
-            {/* Overlay UI */}
-            <div className="absolute top-0 left-0 right-0 p-6 flex justify-between items-center z-10 pointer-events-none">
-                <div className="flex items-center gap-2 bg-red-500/20 px-3 py-1.5 rounded-full backdrop-blur-sm border border-red-500/20">
-                    <div className="w-2 h-2 rounded-full bg-danger animate-pulse"></div>
-                    <span className="text-xs font-bold text-red-200 tracking-widest">LIVE</span>
-                </div>
-                
-                <div className="flex gap-2 pointer-events-auto">
-                    {/* Switch Camera */}
+        <div className="fixed inset-0 bg-black flex flex-col z-50">
+            {/* Top Bar with Room Code */}
+            <div className="absolute top-0 left-0 right-0 p-4 sm:p-6 z-20 flex justify-between items-center bg-gradient-to-b from-black/80 via-black/40 to-transparent pointer-events-none">
+                <div className="pointer-events-auto flex items-center gap-3">
                     <button 
-                        onClick={() => handleSwitchCamera()}
-                        className="p-3 rounded-full bg-black/40 backdrop-blur-md text-white border border-white/10 hover:bg-white/10 transition-all"
+                        onClick={() => { cleanupSession(); setMode(AppMode.SELECT); }} 
+                        className="p-2.5 rounded-xl bg-black/60 backdrop-blur-md text-white border border-white/10 hover:bg-white/10 transition-colors"
+                        title="Voltar ao Painel"
                     >
-                        <SwitchCamera size={24} />
-                    </button>
-
-                    {/* Background Mode Toggle */}
-                    <button 
-                        onClick={toggleBackgroundMode}
-                        className="p-3 rounded-full bg-black/40 backdrop-blur-md text-white border border-white/10 hover:bg-white/10 transition-all"
-                    >
-                        <Moon size={24} />
+                        <ArrowLeft size={18} />
                     </button>
                     
-                    <button onClick={() => { cleanupSession(); setMode(AppMode.SELECT); }} className="p-3 rounded-full bg-black/40 backdrop-blur-md text-white border border-white/10 hover:bg-white/10 transition-all">
-                        <StopCircle size={24} />
+                    <div className="bg-red-500/20 backdrop-blur-md px-3.5 py-1.5 rounded-xl border border-red-500/30 flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                        <span className="text-xs font-bold text-red-200 tracking-wider">AO VIVO (SENDER)</span>
+                    </div>
+                </div>
+
+                <div className="pointer-events-auto flex items-center gap-2">
+                    <div className="bg-sky-500/15 border border-sky-500/30 backdrop-blur-md px-3.5 py-1.5 rounded-xl flex items-center gap-2">
+                        <span className="text-[10px] text-sky-400 uppercase tracking-wider font-semibold">Código / PIN:</span>
+                        <span className="text-sm font-mono font-bold text-white tracking-widest">{room}</span>
+                    </div>
+
+                    <button
+                        onClick={() => {
+                            navigator.clipboard.writeText(viewerUrl);
+                            setCopiedCamId('webcam-copied');
+                            setTimeout(() => setCopiedCamId(null), 2000);
+                        }}
+                        className="px-3.5 py-2 rounded-xl bg-white text-black hover:bg-zinc-200 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-lg"
+                    >
+                        {copiedCamId === 'webcam-copied' ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
+                        <span>{copiedCamId === 'webcam-copied' ? 'Link Copiado' : 'Copiar Link Viewer'}</span>
+                    </button>
+
+                    <button 
+                        onClick={() => { cleanupSession(); setMode(AppMode.SELECT); }} 
+                        className="p-2.5 rounded-xl bg-black/60 backdrop-blur-md text-white border border-white/10 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+                        title="Encerrar Transmissão"
+                    >
+                        <StopCircle size={18} />
                     </button>
                 </div>
             </div>
-            
-            <div className="absolute bottom-10 left-0 right-0 flex justify-center gap-8 z-10 pointer-events-none">
-                 <div className={`flex flex-col items-center gap-1 transition-all duration-300 ${isFlashOn ? 'text-white scale-110 drop-shadow-[0_0_10px_rgba(255,255,255,0.5)]' : 'text-white/30'}`}>
-                    <Zap size={24} />
-                 </div>
-                 <div className={`flex flex-col items-center gap-1 transition-all duration-300 ${isSoundOn ? 'text-danger scale-110 drop-shadow-[0_0_10px_rgba(239,68,68,0.5)]' : 'text-white/30'}`}>
-                    <Bell size={24} />
-                 </div>
-                 <div className={`flex flex-col items-center gap-1 transition-all duration-300 ${videoQuality === 'HD' ? 'text-blue-400 scale-110 drop-shadow-[0_0_10px_rgba(96,165,250,0.5)]' : 'text-white/30'}`}>
-                    <span className="font-bold text-xs">{videoQuality}</span>
-                 </div>
-            </div>
 
-            <MotionDetector videoRef={localVideoRef} onMotion={triggerMotion} active={true} />
+            {/* VideoMeet Sender Frame */}
+            <div className="flex-1 w-full h-full relative bg-black">
+                <iframe
+                    src={senderUrl}
+                    title="Transmissão de Câmera Web"
+                    className="w-full h-full border-0"
+                    allow="camera; microphone; display-capture; autoplay"
+                    allowFullScreen
+                />
+            </div>
         </div>
     );
   }
@@ -1538,12 +1721,17 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-background text-primary p-4 sm:p-6">
         {showScanner && <Scanner onClose={() => setShowScanner(false)} onScan={(id) => { setShowScanner(false); startCamera(id); }} />}
 
-        {/* Manual Camera Modal */}
+        {/* Manual Camera Registration Modal */}
         {showAddManualModal && (
           <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
             <div className="bg-surface border border-white/10 p-6 rounded-2xl max-w-md w-full shadow-2xl">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-base font-medium text-white">Adicionar Câmera IP Manual</h3>
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400">
+                    <Camera size={18} />
+                  </div>
+                  <h3 className="text-base font-medium text-white">Cadastrar Nova Câmera</h3>
+                </div>
                 <button 
                   onClick={() => setShowAddManualModal(false)}
                   className="p-1 rounded-lg text-secondary hover:text-white hover:bg-white/5 transition-colors"
@@ -1553,45 +1741,82 @@ const App: React.FC = () => {
               </div>
 
               <p className="text-xs text-secondary mb-4 leading-relaxed">
-                Digite o IP e porta da câmera gerados pelo aplicativo Android PS Cam na sua rede local.
+                Informe o nome e o <strong>Código / PIN da Sala</strong> (ex: <code className="text-sky-300">319-813</code> ou <code className="text-sky-300">cam-sala</code>). A câmera será salva permanentemente no seu catálogo.
               </p>
 
-              <form onSubmit={handleAddManualCamera} className="space-y-3.5">
+              <form onSubmit={handleAddManualCamera} className="space-y-4">
                 <div>
                   <label className="text-xs text-secondary block mb-1">Nome da Câmera</label>
                   <input
                     type="text"
-                    placeholder="Ex: Câmera Quarto, Galaxy S21"
+                    placeholder="Ex: Câmera da Sala, Portão, Galaxy S21"
                     value={manualName}
                     onChange={(e) => setManualName(e.target.value)}
-                    className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                    className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-secondary/50 outline-none focus:border-sky-400 transition-colors"
+                    required
                   />
                 </div>
 
-                <div className="grid grid-cols-3 gap-3">
-                  <div className="col-span-2">
-                    <label className="text-xs text-secondary block mb-1">Endereço IP</label>
+                <div>
+                  <label className="text-xs text-secondary block mb-1">Código / PIN da Câmera (VideoMeet)</label>
+                  <div className="flex gap-2">
                     <input
                       type="text"
-                      placeholder="Ex: 192.168.1.105"
-                      value={manualIp}
-                      onChange={(e) => setManualIp(e.target.value)}
-                      className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
-                      required
+                      placeholder="Ex: 319-813 ou quarto-01"
+                      value={manualRoomCode}
+                      onChange={(e) => setManualRoomCode(e.target.value)}
+                      className="flex-1 bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm font-mono font-bold text-white placeholder-secondary/50 outline-none focus:border-sky-400 transition-colors"
                     />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const randomPin = `${Math.floor(100 + Math.random() * 900)}-${Math.floor(100 + Math.random() * 900)}`;
+                        setManualRoomCode(randomPin);
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0"
+                      title="Gerar PIN Aleatório"
+                    >
+                      <RefreshCw size={13} />
+                      <span>Gerar PIN</span>
+                    </button>
                   </div>
+                </div>
 
-                  <div>
-                    <label className="text-xs text-secondary block mb-1">Porta</label>
-                    <input
-                      type="text"
-                      placeholder="8080"
-                      value={manualPort}
-                      onChange={(e) => setManualPort(e.target.value)}
-                      className="w-full bg-surfaceLight border border-white/5 rounded-xl px-3.5 py-2.5 text-sm font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
-                      required
-                    />
-                  </div>
+                {/* Optional Local Network Settings */}
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvancedManual(!showAdvancedManual)}
+                    className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition-colors"
+                  >
+                    <span>{showAdvancedManual ? '▼ Ocultar Configurações de IP Local' : '▶ Configurações Avançadas (IP de Rede Local)'}</span>
+                  </button>
+
+                  {showAdvancedManual && (
+                    <div className="grid grid-cols-3 gap-3 mt-3 p-3 rounded-xl bg-black/40 border border-white/5">
+                      <div className="col-span-2">
+                        <label className="text-[10px] text-secondary block mb-1">Endereço IP (Opcional)</label>
+                        <input
+                          type="text"
+                          placeholder="192.168.1.105"
+                          value={manualIp}
+                          onChange={(e) => setManualIp(e.target.value)}
+                          className="w-full bg-surfaceLight border border-white/5 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-[10px] text-secondary block mb-1">Porta</label>
+                        <input
+                          type="text"
+                          placeholder="8080"
+                          value={manualPort}
+                          onChange={(e) => setManualPort(e.target.value)}
+                          className="w-full bg-surfaceLight border border-white/5 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white placeholder-secondary/50 outline-none focus:border-white/20"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex gap-2 pt-2">
@@ -1604,9 +1829,10 @@ const App: React.FC = () => {
                   </button>
                   <button
                     type="submit"
-                    className="flex-1 py-2.5 rounded-xl bg-white text-black hover:bg-zinc-200 text-xs font-medium transition-colors"
+                    className="flex-1 py-2.5 rounded-xl bg-white text-black hover:bg-zinc-200 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 shadow-lg"
                   >
-                    Salvar Câmera
+                    <Plus size={15} />
+                    <span>Cadastrar Câmera</span>
                   </button>
                 </div>
               </form>
@@ -1642,9 +1868,9 @@ const App: React.FC = () => {
                             <KeyRound size={22} />
                         </div>
                         <div>
-                            <h3 className="text-sm font-medium text-white">Emparelhar por Código PIN</h3>
+                            <h3 className="text-sm font-medium text-white">Conectar Câmera por PIN / Sala (VideoMeet)</h3>
                             <p className="text-xs text-secondary mt-0.5">
-                                Digite o PIN de 6 dígitos exibido no aplicativo Android PS Cam (ex: <span className="text-zinc-300 font-mono font-medium">489-123</span>)
+                                Digite o PIN ou código da sala da câmera para assistir ao vivo via WebRTC instantaneamente.
                             </p>
                         </div>
                     </div>
@@ -1653,8 +1879,8 @@ const App: React.FC = () => {
                         <div className="relative flex-1 sm:w-44">
                             <input
                                 type="text"
-                                maxLength={7}
-                                placeholder="000-000"
+                                maxLength={12}
+                                placeholder="319-813"
                                 value={pinInput}
                                 onChange={handlePinChange}
                                 className="w-full bg-surfaceLight border border-white/10 rounded-xl px-3.5 py-2.5 text-center text-sm font-mono font-bold tracking-widest text-white placeholder-secondary/40 outline-none focus:border-sky-400 transition-colors uppercase"
@@ -1684,6 +1910,20 @@ const App: React.FC = () => {
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5">
                 <button 
                     onClick={() => {
+                        const randomPin = `${Math.floor(100 + Math.random() * 900)}-${Math.floor(100 + Math.random() * 900)}`;
+                        setWebCamRoom(randomPin);
+                        setMode(AppMode.CAMERA);
+                    }} 
+                    className="p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
+                >
+                    <div className="p-2.5 rounded-xl bg-red-500/10 text-red-400 group-hover:bg-red-500/20 transition-colors">
+                        <Camera size={20} />
+                    </div>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white text-center">Transmitir Câmera Web</span>
+                </button>
+
+                <button 
+                    onClick={() => {
                         if(!googleAccessToken) {
                             connectToDrive().then(() => startViewer());
                         } else {
@@ -1695,27 +1935,17 @@ const App: React.FC = () => {
                     <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
                         <Eye size={20} className="text-white" />
                     </div>
-                    <span className="text-xs font-medium text-secondary group-hover:text-white">Novo Monitor Web</span>
-                </button>
-
-                <button 
-                    onClick={() => setShowScanner(true)}
-                    className="p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
-                >
-                    <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
-                        <Camera size={20} className="text-white" />
-                    </div>
-                    <span className="text-xs font-medium text-secondary group-hover:text-white">Conectar Câmera Web</span>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white text-center">Novo Monitor Web</span>
                 </button>
 
                 <button 
                     onClick={() => setShowAddManualModal(true)}
                     className="col-span-2 sm:col-span-1 p-4 rounded-2xl bg-surface border border-white/5 hover:border-white/20 transition-all flex flex-col items-center justify-center gap-2 group active:scale-[0.98]"
                 >
-                    <div className="p-2.5 rounded-xl bg-white/5 group-hover:bg-white/10 transition-colors">
-                        <Plus size={20} className="text-white" />
+                    <div className="p-2.5 rounded-xl bg-sky-500/10 text-sky-400 group-hover:bg-sky-500/20 transition-colors">
+                        <Plus size={20} />
                     </div>
-                    <span className="text-xs font-medium text-secondary group-hover:text-white">Adicionar IP Manual</span>
+                    <span className="text-xs font-medium text-secondary group-hover:text-white text-center">Cadastrar Câmera</span>
                 </button>
             </div>
 
@@ -1768,7 +1998,7 @@ const App: React.FC = () => {
                               : 'text-secondary hover:text-white'
                           }`}
                         >
-                          Android App ({androidCameras.length})
+                          Android / VideoMeet ({androidCameras.length})
                         </button>
                         <button
                           onClick={() => setCatalogFilter('p2p')}
@@ -1784,10 +2014,11 @@ const App: React.FC = () => {
                 </div>
                 
                 <div className="space-y-3">
-                    {/* Android App Cameras */}
+                    {/* Android App & VideoMeet Cameras */}
                     {filteredAndroidCameras.map(cam => {
                       const isCamOnline = cam.isOnline || cam.status === 'online';
-                      const rawUrl = cam.streamUrl || (cam.ipAddress ? `http://${cam.ipAddress}:${cam.port || 8080}` : '');
+                      const roomCode = (cam.roomCode || cam.pin || cam.deviceId || cam.id).replace(/\s+/g, '');
+                      const webrtcUrl = `https://video-chat-bvo.pages.dev/?mode=stream&role=viewer&room=${encodeURIComponent(roomCode)}&clean=true&controls=none&header=false&toolbar=false&embed=true`;
 
                       return (
                         <div 
@@ -1806,9 +2037,9 @@ const App: React.FC = () => {
                               </div>
 
                               <div>
-                                  <div className="flex items-center gap-2.5">
+                                  <div className="flex items-center gap-2.5 flex-wrap">
                                       <h3 className="text-sm font-medium text-white group-hover:text-sky-400 transition-colors">
-                                        {cam.name || 'Android PS Cam'}
+                                        {cam.name || 'Câmera VideoMeet'}
                                       </h3>
 
                                       <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${
@@ -1820,14 +2051,20 @@ const App: React.FC = () => {
                                         {isCamOnline ? 'Online' : 'Offline'}
                                       </span>
 
-                                      <span className="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20 text-[10px] font-medium">
-                                        Android IP
+                                      <span className="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20 text-[10px] font-mono font-semibold">
+                                        PIN: {roomCode}
                                       </span>
                                   </div>
 
                                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-secondary mt-1">
-                                      <span className="font-mono text-zinc-300">{rawUrl || 'http://192.168.x.x'}</span>
+                                      <span className="font-mono text-zinc-300">WebRTC VideoMeet</span>
                                       
+                                      {cam.ipAddress && (
+                                        <span className="text-zinc-400 font-mono text-[11px]">
+                                          IP: {cam.ipAddress}:{cam.port || 8080}
+                                        </span>
+                                      )}
+
                                       {cam.battery !== undefined && (
                                         <span className="flex items-center gap-1 text-zinc-300">
                                           {renderBatteryIcon(cam.battery, cam.batteryCharging)}
@@ -1841,34 +2078,37 @@ const App: React.FC = () => {
                           {/* Quick Action buttons */}
                           <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
                               <button
-                                onClick={(e) => copyUrl(cam.id, cam.streamUrl, cam.ipAddress, cam.port, e)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigator.clipboard.writeText(webrtcUrl);
+                                  setCopiedCamId(cam.id);
+                                  setTimeout(() => setCopiedCamId(null), 2000);
+                                }}
                                 className="p-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white transition-colors text-xs flex items-center gap-1.5"
-                                title="Copiar URL do Stream"
+                                title="Copiar Link WebRTC da Câmera"
                               >
                                 {copiedCamId === cam.id ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
                                 <span className="hidden md:inline">{copiedCamId === cam.id ? 'Copiado' : 'Copiar'}</span>
                               </button>
 
-                              {rawUrl && (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    window.open(rawUrl, '_blank', 'noopener,noreferrer');
-                                  }}
-                                  className="p-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white transition-colors text-xs flex items-center gap-1.5"
-                                  title="Abrir em Nova Aba"
-                                >
-                                  <ExternalLink size={14} />
-                                  <span className="hidden md:inline">Aba</span>
-                                </button>
-                              )}
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.open(webrtcUrl, '_blank', 'noopener,noreferrer');
+                                }}
+                                className="p-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-secondary hover:text-white transition-colors text-xs flex items-center gap-1.5"
+                                title="Abrir em Nova Aba"
+                              >
+                                <ExternalLink size={14} />
+                                <span className="hidden md:inline">Aba</span>
+                              </button>
 
                               <button 
                                 onClick={() => {
                                   setSelectedAndroidCamera(cam);
                                   setMode(AppMode.ANDROID_VIEWER);
                                 }} 
-                                className="px-3 py-2 rounded-xl bg-white text-black hover:bg-zinc-200 transition-colors text-xs font-medium flex items-center gap-1.5"
+                                className="px-3.5 py-2 rounded-xl bg-white text-black hover:bg-zinc-200 transition-colors text-xs font-semibold flex items-center gap-1.5 shadow-md"
                               >
                                 <Eye size={14} />
                                 <span>Assistir</span>

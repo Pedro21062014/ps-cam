@@ -28,6 +28,7 @@ export interface AndroidCamera {
   userId?: string;
   userEmail?: string;
   pin?: string;
+  roomCode?: string;
   lastSeen?: any;
   updatedAt?: any;
   source?: 'firestore' | 'rtdb' | 'firestore-user' | 'rtdb-user' | 'manual' | 'pin';

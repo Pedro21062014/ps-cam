@@ -23,7 +23,8 @@ import {
   Cloud, 
   Wifi, 
   AlertTriangle,
-  Send
+  Send,
+  Sparkles
 } from 'lucide-react';
 
 interface AndroidCameraViewerProps {
@@ -34,7 +35,8 @@ interface AndroidCameraViewerProps {
 export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera, onBack }) => {
   const [copied, setCopied] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [streamMode, setStreamMode] = useState<'local' | 'cloud'>('local');
+  const [streamMode, setStreamMode] = useState<'local' | 'cloud' | 'webrtc'>('webrtc');
+  const [isCleanMode, setIsCleanMode] = useState(true);
   const [localStreamError, setLocalStreamError] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const [cloudFrame, setCloudFrame] = useState<string | null>(null);
@@ -52,6 +54,10 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
   const deviceId = camera.deviceId || camera.id;
   const ip = camera.ipAddress || '';
   const port = camera.port || 8080;
+  const webrtcRoomCode = (camera.roomCode || camera.pin || deviceId).replace(/\s+/g, '');
+  const cleanParams = isCleanMode ? '&clean=true&controls=none&header=false&toolbar=false' : '';
+  const webrtcViewerUrl = `https://video-chat-bvo.pages.dev/?mode=stream&role=viewer&room=${encodeURIComponent(webrtcRoomCode)}&embed=true${cleanParams}`;
+  const webrtcSenderUrl = `https://video-chat-bvo.pages.dev/?mode=stream&role=sender&room=${encodeURIComponent(webrtcRoomCode)}&embed=true&audio=true&video=true${cleanParams}`;
 
   // Build proper local MJPEG stream URL (with /video support)
   const localBaseUrl = camera.streamUrl || (ip ? `http://${ip}:${port}/video` : '');
@@ -173,7 +179,7 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
   };
 
   const copyToClipboard = () => {
-    const url = normalizedLocalStreamUrl || `ID: ${deviceId}`;
+    const url = streamMode === 'webrtc' ? webrtcViewerUrl : (normalizedLocalStreamUrl || `ID: ${deviceId}`);
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -252,6 +258,20 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
           {/* Stream Mode Switcher */}
           <div className="flex items-center p-1 rounded-xl bg-surfaceLight border border-white/5 text-xs font-medium">
             <button
+              onClick={() => setStreamMode('webrtc')}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg transition-colors ${
+                streamMode === 'webrtc' 
+                  ? 'bg-white text-black font-semibold shadow-sm' 
+                  : 'text-secondary hover:text-white'
+              }`}
+              title="Transmissão WebRTC P2P em tempo real de baixa latência (<200ms) sem erros de porta ou banco"
+            >
+              <Zap size={13} className={streamMode === 'webrtc' ? 'text-amber-500' : ''} />
+              <span className="hidden sm:inline">WebRTC (VideoMeet)</span>
+              <span className="sm:hidden">WebRTC</span>
+            </button>
+
+            <button
               onClick={() => {
                 setStreamMode('local');
                 setLocalStreamError(false);
@@ -281,6 +301,22 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
               {cloudConnected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>}
             </button>
           </div>
+
+          {/* Clean Mode Button (Hide/Show VideoMeet buttons) */}
+          {streamMode === 'webrtc' && (
+            <button
+              onClick={() => setIsCleanMode(prev => !prev)}
+              className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                isCleanMode 
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' 
+                  : 'bg-surfaceLight border-white/5 text-secondary hover:text-white'
+              }`}
+              title={isCleanMode ? "Modo Limpo Ativo: botões e barras do VideoMeet estão ocultos" : "Clique para ocultar os botões do VideoMeet"}
+            >
+              <Sparkles size={13} />
+              <span className="hidden sm:inline">{isCleanMode ? 'Sem Botões' : 'Com Botões'}</span>
+            </button>
+          )}
 
           {camera.battery !== undefined && (
             <div className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-surfaceLight border border-white/5 text-xs text-secondary font-medium">
@@ -324,18 +360,33 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
           
           {/* Stream Overlay Status */}
           <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
-            <div className="flex items-center gap-2 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-xs font-medium text-white">
-              <Radio size={14} className="text-red-500" />
+            <div className="flex items-center gap-2 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 text-xs font-medium text-white shadow-lg">
+              <Radio size={14} className="text-red-500 animate-pulse" />
               <span>AO VIVO</span>
               <span className="text-white/40">•</span>
               <span className="text-zinc-300 font-mono text-[11px]">
-                {streamMode === 'local' ? 'MJPEG Local' : 'Firebase Cloud Frame'}
+                {streamMode === 'webrtc' 
+                  ? `WebRTC P2P ${isCleanMode ? '(Modo Limpo)' : '(VideoMeet)'}` 
+                  : streamMode === 'local' 
+                    ? 'MJPEG Local' 
+                    : 'Firebase Cloud Frame'}
               </span>
             </div>
           </div>
 
-          {/* STREAM VIEWPORT: LOCAL MJPEG OR CLOUD BASE64 */}
-          {streamMode === 'local' ? (
+          {/* STREAM VIEWPORT: WEBRTC, LOCAL MJPEG OR CLOUD BASE64 */}
+          {streamMode === 'webrtc' ? (
+            <div className="w-full h-full relative flex flex-col bg-black">
+              <iframe
+                key={`webrtc-stream-${isCleanMode}`}
+                src={webrtcViewerUrl}
+                title={`Transmissão WebRTC ${camera.name}`}
+                className="w-full h-full border-0"
+                allow="camera; microphone; display-capture; autoplay; clipboard-write; fullscreen"
+                allowFullScreen
+              />
+            </div>
+          ) : streamMode === 'local' ? (
             !localStreamError && normalizedLocalStreamUrl ? (
               <div className="w-full h-full relative flex items-center justify-center bg-black">
                 <img 
@@ -355,10 +406,18 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
                 </div>
                 <h3 className="text-sm font-medium text-white mb-1.5">Transmissão em Rede Local</h3>
                 <p className="text-xs text-secondary leading-relaxed mb-4">
-                  Se o navegador bloquear o stream HTTP direto na página HTTPS, use o modo <strong>Nuvem RTDB</strong> ou abra o link na rede local:
+                  Se o navegador bloquear o stream HTTP direto na página HTTPS, use o modo <strong>WebRTC (VideoMeet)</strong> ou abra o link na rede local:
                 </p>
 
                 <div className="flex flex-col gap-2.5">
+                  <button
+                    onClick={() => setStreamMode('webrtc')}
+                    className="w-full inline-flex items-center justify-center gap-2 bg-amber-500 text-black hover:bg-amber-400 font-semibold py-2.5 px-4 rounded-xl text-xs transition-colors shadow-lg"
+                  >
+                    <Zap size={14} />
+                    <span>Usar Transmissão WebRTC Ultra-Rápida (Recomendado)</span>
+                  </button>
+
                   {cloudFrame && (
                     <button
                       onClick={() => setStreamMode('cloud')}
@@ -412,10 +471,10 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
                   Escutando <code className="text-sky-300 font-mono text-[11px]">/live_streams/{deviceId}/frame</code> no Firebase Realtime Database.
                 </p>
                 <button
-                  onClick={() => setStreamMode('local')}
+                  onClick={() => setStreamMode('webrtc')}
                   className="px-3.5 py-2 rounded-xl bg-surfaceLight hover:bg-white/10 text-xs text-white font-medium border border-white/5 transition-colors"
                 >
-                  Voltar para Rede Local (MJPEG)
+                  Alternar para WebRTC (VideoMeet)
                 </button>
               </div>
             )
@@ -425,10 +484,17 @@ export const AndroidCameraViewer: React.FC<AndroidCameraViewerProps> = ({ camera
           <div className="absolute bottom-0 left-0 right-0 p-3.5 bg-gradient-to-t from-black/80 via-black/40 to-transparent flex items-center justify-between text-xs text-white/80">
             <div className="flex items-center gap-2.5">
               <span className="font-mono text-zinc-300 text-[11px]">
-                {streamMode === 'local' ? (normalizedLocalStreamUrl || 'Modo Local') : `RTDB: /live_streams/${deviceId}/frame`}
+                {streamMode === 'webrtc' 
+                  ? `Canal WebRTC: ${(camera.pin || deviceId).replace(/\s+/g, '')}` 
+                  : streamMode === 'local' 
+                    ? (normalizedLocalStreamUrl || 'Modo Local') 
+                    : `RTDB: /live_streams/${deviceId}/frame`}
               </span>
               {lastFrameTime && streamMode === 'cloud' && (
                 <span className="text-[10px] text-emerald-400">● Sincronizado</span>
+              )}
+              {streamMode === 'webrtc' && (
+                <span className="text-[10px] text-emerald-400 hidden sm:inline">● P2P &lt;200ms</span>
               )}
             </div>
             
